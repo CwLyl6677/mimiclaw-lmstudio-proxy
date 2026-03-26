@@ -10,31 +10,149 @@
  *   - Uses mbedTLS-compatible cipher suites
  *   - Replaces model name in request body with local model
  *   - Forwards to LM Studio via plain HTTP (127.0.0.1:1234)
+ *   - Auto-generates self-signed cert on first run (no OpenSSL needed)
+ *     自动在首次运行时生成自签名证书，无需安装 OpenSSL
  *
  * Usage: node mimiclaw-proxy.js
  */
 
-const http  = require('http');
-const https = require('https');
-const tls   = require('tls');
-const net   = require('net');
-const fs    = require('fs');
-const path  = require('path');
-const url   = require('url');
+const http   = require('http');
+const tls    = require('tls');
+const net    = require('net');
+const fs     = require('fs');
+const path   = require('path');
+const url    = require('url');
+const crypto = require('crypto');
+const { execSync } = require('child_process');
 
 // ── Configuration ─────────────────────────────────────────────────────────────
-const PROXY_PORT   = 7890;           // Port ESP32 connects to
-const LM_HOST      = '127.0.0.1';   // LM Studio host
-const LM_PORT      = 1234;           // LM Studio port
+const PROXY_PORT   = 7890;               // Port ESP32 connects to
+const LM_HOST      = '127.0.0.1';       // LM Studio host
+const LM_PORT      = 1234;              // LM Studio port
 const TARGET_MODEL = 'qwen/qwen3.5-9b'; // Local model name (change as needed)
-const CERT_DIR     = __dirname;      // Directory containing proxy-key.pem / proxy-cert.pem
+const CERT_DIR     = __dirname;          // Directory for proxy-key.pem / proxy-cert.pem
+
+// ── Auto-generate self-signed certificate if not present ─────────────────────
+// 首次运行时自动生成证书，无需手动执行 gen-cert / OpenSSL
+// Cert is generated using Node.js built-in crypto — no OpenSSL required.
+const KEY_FILE  = path.join(CERT_DIR, 'proxy-key.pem');
+const CERT_FILE = path.join(CERT_DIR, 'proxy-cert.pem');
+
+function generateSelfSignedCert() {
+  console.log('[cert] 首次运行，正在自动生成自签名证书... / First run, generating self-signed cert...');
+
+  // Generate RSA-2048 key pair
+  const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    publicKeyEncoding:  { type: 'spki',  format: 'pem' },
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  });
+
+  // Build a minimal self-signed X.509 v3 certificate using ASN.1 DER
+  function encLen(n) {
+    if (n < 0x80) return Buffer.from([n]);
+    if (n < 0x100) return Buffer.from([0x81, n]);
+    return Buffer.from([0x82, (n >> 8) & 0xff, n & 0xff]);
+  }
+  function tlv(tag, val) {
+    const v = Buffer.isBuffer(val) ? val : Buffer.from(val);
+    return Buffer.concat([Buffer.from([tag]), encLen(v.length), v]);
+  }
+  const seq  = v => tlv(0x30, v);
+  const set_ = v => tlv(0x31, v);
+  const ctx0 = v => tlv(0xa0, v);
+  const ctx3 = v => tlv(0xa3, v);
+
+  function oidBuf(dotted) {
+    const p = dotted.split('.').map(Number);
+    const out = [40 * p[0] + p[1]];
+    for (let i = 2; i < p.length; i++) {
+      let v = p[i]; const b = [];
+      b.unshift(v & 0x7f); v >>= 7;
+      while (v) { b.unshift((v & 0x7f) | 0x80); v >>= 7; }
+      out.push(...b);
+    }
+    return tlv(0x06, Buffer.from(out));
+  }
+
+  function pStr(s) { return tlv(0x13, Buffer.from(s, 'ascii')); }
+  function utcTime(d) {
+    const p = n => String(n).padStart(2, '0');
+    const s = String(d.getUTCFullYear()).slice(-2)
+      + p(d.getUTCMonth()+1) + p(d.getUTCDate())
+      + p(d.getUTCHours()) + p(d.getUTCMinutes()) + p(d.getUTCSeconds()) + 'Z';
+    return tlv(0x17, Buffer.from(s, 'ascii'));
+  }
+  function rdnSeq(oidS, val) {
+    return set_(seq(Buffer.concat([oidBuf(oidS), pStr(val)])));
+  }
+  function name(cn, o, c) {
+    return seq(Buffer.concat([rdnSeq('2.5.4.6', c), rdnSeq('2.5.4.10', o), rdnSeq('2.5.4.3', cn)]));
+  }
+
+  // Serial number (random 16 bytes, ensure positive)
+  let serial = crypto.randomBytes(16);
+  if (serial[0] & 0x80) serial = Buffer.concat([Buffer.from([0x00]), serial]);
+  const serialTlv = tlv(0x02, serial);
+
+  // Validity
+  const notBefore = new Date();
+  const notAfter  = new Date(notBefore); notAfter.setFullYear(notAfter.getFullYear() + 10);
+
+  // SHA-256 with RSA OID
+  const sigAlg = seq(Buffer.concat([oidBuf('1.2.840.113549.1.1.11'), tlv(0x05, Buffer.alloc(0))]));
+
+  // Subject / Issuer
+  const subject = name('api.openai.com', 'MimiClaw Proxy', 'CN');
+
+  // SubjectPublicKeyInfo from publicKey PEM (SPKI format)
+  const spkiDer = crypto.createPublicKey({ key: publicKey, format: 'pem' }).export({ type: 'spki', format: 'der' });
+
+  // Extensions: subjectAltName dNSName=api.openai.com
+  const sanOid  = oidBuf('2.5.29.17');
+  const sanVal  = tlv(0x04, seq(tlv(0x82, Buffer.from('api.openai.com', 'ascii'))));
+  const extSeq  = ctx3(seq(seq(Buffer.concat([sanOid, sanVal]))));
+
+  // TBSCertificate
+  const tbs = seq(Buffer.concat([
+    ctx0(tlv(0x02, Buffer.from([0x02]))),           // version v3
+    serialTlv,                                       // serial
+    sigAlg,                                          // signatureAlgorithm
+    subject,                                         // issuer (self-signed)
+    seq(Buffer.concat([utcTime(notBefore), utcTime(notAfter)])), // validity
+    subject,                                         // subject
+    Buffer.from(spkiDer),                            // subjectPublicKeyInfo
+    extSeq,                                          // extensions
+  ]));
+
+  // Sign TBS
+  const sig = crypto.createSign('sha256').update(tbs).sign(
+    crypto.createPrivateKey({ key: privateKey, format: 'pem' })
+  );
+  // BIT STRING: 0x00 + signature bytes
+  const bitStr = tlv(0x03, Buffer.concat([Buffer.from([0x00]), sig]));
+
+  // Final certificate DER
+  const certDer = seq(Buffer.concat([tbs, sigAlg, bitStr]));
+  const b64 = certDer.toString('base64').match(/.{1,64}/g).join('\n');
+  const certPem = `-----BEGIN CERTIFICATE-----\n${b64}\n-----END CERTIFICATE-----\n`;
+
+  fs.writeFileSync(KEY_FILE,  privateKey);
+  fs.writeFileSync(CERT_FILE, certPem);
+  console.log('[cert] ✓ proxy-key.pem + proxy-cert.pem 已生成 / generated');
+}
+
+// Load or generate certificate
+if (!fs.existsSync(KEY_FILE) || !fs.existsSync(CERT_FILE)) {
+  generateSelfSignedCert();
+}
 
 // ── TLS options: force TLS 1.2 for ESP32 mbedTLS compatibility ───────────────
 // ESP32 mbedTLS defaults to TLS 1.2 only. Node.js 18+ defaults to TLS 1.3,
 // which causes mbedtls_ssl_handshake to return -0x7280 (FATAL_ALERT_MESSAGE).
 const tlsOptions = {
-  key:  fs.readFileSync(path.join(CERT_DIR, 'proxy-key.pem')),
-  cert: fs.readFileSync(path.join(CERT_DIR, 'proxy-cert.pem')),
+  key:  fs.readFileSync(KEY_FILE),
+  cert: fs.readFileSync(CERT_FILE),
   rejectUnauthorized: false,
   minVersion: 'TLSv1.2',
   maxVersion: 'TLSv1.2',
@@ -52,10 +170,8 @@ const tlsOptions = {
     'ECDHE-RSA-AES256-SHA',
     'AES128-SHA',
     'AES256-SHA',
-    'RSA-PSK-AES128-CBC-SHA256',
-    'RSA-PSK-AES256-CBC-SHA384',
   ].join(':'),
-  sessionTimeout: 0, // Disable session tickets for mbedTLS compatibility
+  sessionTimeout: 0,
 };
 
 // Hostnames to intercept (add more as needed)
