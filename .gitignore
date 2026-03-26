@@ -1,0 +1,4 @@
+proxy-key.pem
+proxy-cert.pem
+node_modules/
+*.log
