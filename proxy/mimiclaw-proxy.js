@@ -32,14 +32,8 @@ const LM_PORT      = 1234;              // LM Studio port
 const TARGET_MODEL = 'qwen/qwen3.5-9b'; // Local model name (change as needed)
 const CERT_DIR     = __dirname;          // Directory for proxy-key.pem / proxy-cert.pem
 
-// ── Upstream proxy for blocked hosts (e.g. Telegram) ─────────────────────────
-// Set UPSTREAM_PROXY to your local VPN/科学上网 SOCKS5 or HTTP proxy address.
-// Example: 'socks5://127.0.0.1:7897' or 'http://127.0.0.1:7897'
-// Leave empty ('') to disable and attempt direct connection.
-const UPSTREAM_PROXY = process.env.UPSTREAM_PROXY || 'http://127.0.0.1:7897';
 
-// Hostnames that must be routed through the upstream proxy instead of direct
-const PROXY_REQUIRED_HOSTS = ['api.telegram.org'];
+
 
 // ── Auto-generate self-signed certificate if not present ─────────────────────
 // 首次运行时自动生成证书，无需手动执行 gen-cert / OpenSSL
@@ -318,81 +312,13 @@ const server = http.createServer((req, res) => {
   }
 });
 
-// ── Connect to target host via upstream HTTP proxy ────────────────────────────
-// Used for hosts that are blocked (e.g. api.telegram.org needs to go through
-// a VPN / 科学上网 proxy rather than direct connection).
-function connectViaUpstreamProxy(targetHost, targetPort, clientSocket, head) {
-  const parsed = new URL(UPSTREAM_PROXY);
-  const upstreamPort = parseInt(parsed.port) || (parsed.protocol === 'https:' ? 443 : 1080);
-  const upstreamHost = parsed.hostname;
-
-  if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-    // HTTP CONNECT through upstream HTTP proxy
-    const connectReq = `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\nHost: ${targetHost}:${targetPort}\r\nProxy-Connection: keep-alive\r\n\r\n`;
-    const upstream = net.connect(upstreamPort, upstreamHost, () => {
-      upstream.write(connectReq);
-    });
-
-    let established = false;
-    let buf = Buffer.alloc(0);
-    upstream.on('data', chunk => {
-      if (established) {
-        clientSocket.write(chunk);
-        return;
-      }
-      buf = Buffer.concat([buf, chunk]);
-      const idx = buf.indexOf('\r\n\r\n');
-      if (idx === -1) return;
-      const statusLine = buf.slice(0, buf.indexOf('\r\n')).toString();
-      const rest = buf.slice(idx + 4);
-      established = true;
-
-      if (statusLine.includes('200')) {
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        if (head && head.length > 0) upstream.write(head);
-        if (rest.length > 0) clientSocket.write(rest);
-        clientSocket.pipe(upstream);
-        upstream.pipe(clientSocket);
-      } else {
-        console.error(`[upstream-proxy] CONNECT failed: ${statusLine}`);
-        clientSocket.end();
-        upstream.end();
-      }
-    });
-
-    upstream.on('error', err => {
-      console.error(`[upstream-proxy] connection error: ${err.message}`);
-      clientSocket.end();
-    });
-    clientSocket.on('close', () => upstream.destroy());
-  } else {
-    // Unsupported upstream proxy protocol, fall back to direct
-    console.warn(`[upstream-proxy] unsupported protocol ${parsed.protocol}, falling back to direct`);
-    const remote = net.connect(targetPort, targetHost, () => {
-      clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      if (head && head.length > 0) remote.write(head);
-      remote.pipe(clientSocket);
-      clientSocket.pipe(remote);
-    });
-    remote.on('error', () => clientSocket.end());
-  }
-}
-
 // ── HTTPS CONNECT handler: TLS MITM termination ──────────────────────────────
 server.on('connect', (req, clientSocket, head) => {
   const [hostname, portStr] = req.url.split(':');
 
   if (!shouldForward(hostname)) {
+    // Pass through for non-target hosts
     const port = parseInt(portStr) || 443;
-
-    // Hosts that require upstream proxy (e.g. blocked by GFW)
-    if (UPSTREAM_PROXY && PROXY_REQUIRED_HOSTS.includes(hostname)) {
-      console.log(`[upstream-proxy] CONNECT ${hostname}:${port} → via ${UPSTREAM_PROXY}`);
-      connectViaUpstreamProxy(hostname, port, clientSocket, head);
-      return;
-    }
-
-    // Direct passthrough for all other hosts
     console.log(`[passthrough] CONNECT ${hostname}:${port}`);
     const remote = net.connect(port, hostname, () => {
       clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
