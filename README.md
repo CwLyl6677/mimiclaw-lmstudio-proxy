@@ -287,6 +287,7 @@ maxVersion: 'TLSv1.2',
 | ESP32 无法连接代理 | `TCP connect failed` | Windows 网络类型为 Public，阻止所有入站 | 改为 Private 并添加防火墙规则 |
 | 证书验证失败 | `Failed to verify certificate` | sdkconfig 缺少父选项或 `crt_bundle_attach` 非 NULL | 两个 CONFIG 都要开，代码设 NULL |
 | 飞书回复极慢（模型已出结果仍等待） | 发消息后数十秒才回复，LMStudio 日志显示生成已完成 | 代理返回 `Connection: keep-alive`，ESP32 读取循环无 Content-Length 解析，只能等 TCP 超时（最长 120 s）才退出 | 代理改为 `Connection: close`；固件 `llm_http_via_proxy` 改为两阶段读取：先读完 HTTP 头，解析 Content-Length，精确读取 body 后立即退出 |
+| 询问时间返回"HTTP连接错误" | MimicLaw 调用 `get_time` 工具报错，LMStudio 直接测试正常 | `tool_get_time` 向 `api.telegram.org` 发 HEAD 请求获取时间，但代理对非 OpenAI/Anthropic 域名直连，而国内直连 Telegram 被墙 | 代理新增上游代理转发：`PROXY_REQUIRED_HOSTS` 中的域名（含 api.telegram.org）通过本机科学上网（`UPSTREAM_PROXY=http://127.0.0.1:7897`）转发 |
 
 ---
 
@@ -583,6 +584,7 @@ maxVersion: 'TLSv1.2',
 | ESP32 cannot reach proxy | `TCP connect failed` | Windows network profile set to Public, blocking inbound connections | Change to Private and add firewall rule |
 | Certificate verification failure | `Failed to verify certificate` | sdkconfig missing parent option or `crt_bundle_attach` was not NULL | Enable both CONFIG options; set field to NULL |
 | Feishu reply extremely slow (model already done) | Reply arrives tens of seconds after sending; LMStudio log shows generation complete | Proxy returned `Connection: keep-alive`; ESP32 read loop had no Content-Length parsing and waited for TCP timeout (up to 120 s) to exit | Proxy changed to `Connection: close`; firmware `llm_http_via_proxy` rewritten to two-phase read: parse headers first, extract Content-Length, read exact body bytes and exit immediately |
+| `get_time` tool returns HTTP connection error | MimicLaw reports error when asked about current time; works fine from LMStudio directly | `tool_get_time` sends a HEAD request to `api.telegram.org` to read the Date header, but proxy passed it through as a direct connection — Telegram is blocked in mainland China | Added upstream proxy routing: hosts in `PROXY_REQUIRED_HOSTS` (including api.telegram.org) are tunnelled through the local VPN proxy (`UPSTREAM_PROXY=http://127.0.0.1:7897`) |
 
 ---
 
