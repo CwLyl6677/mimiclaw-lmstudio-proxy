@@ -260,7 +260,7 @@ function handleDecryptedSocket(socket, hostname, isAnthropic, headData) {
           `HTTP/1.1 ${proxyRes.statusCode} OK`,
           'Content-Type: application/json',
           `Content-Length: ${respBody.length}`,
-          'Connection: keep-alive',
+          'Connection: close',
           '', '',
         ].join('\r\n');
         try {
